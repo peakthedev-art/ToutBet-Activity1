@@ -1,0 +1,9 @@
+*{box-sizing:border-box}body{font:16px/1.5 system-ui,sans-serif;margin:0;background:#f5f6fa;color:#1c1e26}
+.demo{background:#b45309;color:#fff;text-align:center;padding:.4rem;font-weight:600}
+header{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;padding:.6rem 1rem;background:#1c1e26;color:#fff}
+nav{display:flex;flex-wrap:wrap;gap:.5rem}nav a,nav button{color:#fff;background:none;border:0;font:inherit;text-decoration:underline;cursor:pointer;padding:.4rem}
+main{max-width:640px;margin:0 auto;padding:1rem}.card{background:#fff;border-radius:10px;padding:1rem;margin:.6rem 0;box-shadow:0 1px 3px #0002}
+input,select,button{font:inherit;padding:.6rem;margin:.25rem 0;max-width:100%}input,select{width:100%;border:1px solid #888;border-radius:6px}
+button.p{background:#2347d8;color:#fff;border:0;border-radius:6px;cursor:pointer}button:focus,input:focus,a:focus,select:focus{outline:3px solid #f59e0b}
+#msg{max-width:640px;margin:.5rem auto;padding:0 1rem;font-weight:600}.err{color:#b91c1c}.ok{color:#15803d}small{color:#555}
+table{width:100%;border-collapse:collapse;font-size:.9rem}td,th{padding:.3rem;border-bottom:1px solid #ddd;text-align:left}
