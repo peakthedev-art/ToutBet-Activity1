@@ -8,10 +8,11 @@
 ```bash
 cd toutbet
 python3 toutbet.py --seed        # crée la base + comptes démo (mots de passe aléatoires affichés une fois)
+python3 toutbet.py --more-bets   # (facultatif) ajoute 3 paris de démo supplémentaires, sans doublon
 python3 toutbet.py               # http://127.0.0.1:8000  (administration : /admin)
 python3 -m unittest discover -s tests -v   # tests
 ```
-Variables : `PORT`, `TOUTBET_DB`, `TOUTBET_SECURE_COOKIE=1` (derrière HTTPS). Aucun secret dans le code.
+Variables : `PORT`, `TOUTBET_DB` (chemin de la base, défaut `~/.toutbet/toutbet.db`), `TOUTBET_SECURE_COOKIE=1` (derrière HTTPS). Aucun secret dans le code. Au démarrage, le mode démo crée comptes et paris si la base est vide ou s'il n'y a plus de pari ouvert (désactivable : `TOUTBET_NO_DEMO=1`).
 > Les tests n'ont **pas été exécutés** lors de la génération : lancez-les vous-même.
 
 ## Où sont les protections (`toutbet.py`)
@@ -29,6 +30,12 @@ Variables : `PORT`, `TOUTBET_DB`, `TOUTBET_SECURE_COOKIE=1` (derrière HTTPS). A
 **Blocage volontaire :** 1/7/30 jours, non raccourcissable (`test_self_block`).
 **Journal :** la chaîne de hachage détecte des altérations simples, ce n'est **pas** une preuve juridique infaillible.
 **Limites connues :** limitation de débit en mémoire (un seul processus), pas de HTTPS ni de 2FA (recommandés), l'IP proxy n'est pas lue.
+
+## Données personnelles (important)
+La base SQLite contient e-mails, noms, hachages de mots de passe, historiques et journaux. **Elle ne doit jamais être publiée.** Par défaut elle est créée **hors du dépôt** (`~/.toutbet/`, dossier 700, fichier 600) et `.gitignore` exclut `*.db`. Les mots de passe sont hachés (scrypt) et les jetons de session stockés hachés, mais les e-mails et historiques restent lisibles : en cas de fuite du fichier, ce sont des données personnelles exposées (RGPD). Ne mettez jamais de vraies données dans un dépôt public.
+
+## Profil
+`PATCH /api/me` (pseudo, nom : liste blanche), `POST /api/me/email` et `POST /api/me/password` (mot de passe actuel exigé, limités en débit, journalisés ; le changement de mot de passe déconnecte les autres appareils).
 
 ## Vérifications manuelles
 **Parcours normal :** créer un compte (100 € fictifs) → se connecter → ouvrir un pari → participer (confirmation) → consulter notifications → Mon espace (historique, stats, retrait fictif) → Profil (blocage) → Bookie : créer, clôturer, proposer le résultat, régler.

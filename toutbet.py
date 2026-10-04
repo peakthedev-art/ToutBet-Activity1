@@ -4,14 +4,15 @@ from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-DB = os.environ.get("TOUTBET_DB", "toutbet.db")
+# Base HORS du dépôt par défaut (données personnelles) : ~/.toutbet/toutbet.db
+DB = os.environ.get("TOUTBET_DB") or os.path.join(os.path.expanduser("~"), ".toutbet", "toutbet.db")
 SECURE = os.environ.get("TOUTBET_SECURE_COOKIE") == "1"
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 OFFSET = [0]  # décalage d'horloge (tests uniquement)
 def now(): return int(time.time()) + OFFSET[0]
 
 SCHEMA = """
-create table if not exists users(id integer primary key, email text unique not null, name text not null, ph text not null, role text not null default 'parieur', status text not null default 'active', block_until integer not null default 0, bal integer not null default 0, ts integer);
+create table if not exists users(id integer primary key, email text unique not null, name text not null, fullname text not null default '', ph text not null, role text not null default 'parieur', status text not null default 'active', block_until integer not null default 0, bal integer not null default 0, ts integer);
 create table if not exists sess(th text primary key, uid integer not null, csrf text not null, exp integer not null);
 create table if not exists bets(id integer primary key, bookie integer not null, title text not null, stake integer not null, status text not null default 'open', closes_at integer not null, result integer, ts integer);
 create table if not exists choices(id integer primary key, bet integer not null, label text not null, pct integer not null);
@@ -22,9 +23,15 @@ create table if not exists votes(bet integer, uid integer, kind text, comment te
 create table if not exists audit(id integer primary key, ts integer, actor integer, action text, target text, bet integer, detail text, prev text, hash text);
 """
 def db():
+    d = os.path.dirname(DB)
+    if d: os.makedirs(d, mode=0o700, exist_ok=True)
     c = sqlite3.connect(DB, timeout=10, isolation_level=None); c.row_factory = sqlite3.Row; return c
 def init():
-    c = db(); c.executescript(SCHEMA); c.close()
+    c = db(); c.executescript(SCHEMA)
+    if "fullname" not in [r[1] for r in c.execute("pragma table_info(users)")]: c.execute("alter table users add column fullname text not null default ''")
+    c.close()
+    try: os.chmod(DB, 0o600)  # lisible uniquement par le propriétaire
+    except OSError: pass
 
 class Err(Exception):
     def __init__(s, st, msg): s.st, s.msg = st, msg
@@ -81,7 +88,10 @@ def get_bet(c, bid):
     if not b: raise Err(404, "Pari introuvable")
     return b
 def pub(c, b, uid):
-    ch = [dict(id=r[0], label=r[1], pct=r[2]) for r in c.execute("select id,label,pct from choices where bet=? order by id", (b["id"],))]
+    tot = c.execute("select count(*) from parts where bet=?", (b["id"],)).fetchone()[0]
+    # cote estimée = 100/probabilité du Bookie ; cote actuelle = cagnotte / mises sur ce choix (gain réel, partagé entre gagnants)
+    ch = [dict(id=r[0], label=r[1], pct=r[2], n=r[3], cote=round(100 / r[2], 2), cote_live=round(tot / r[3], 2) if r[3] else None)
+          for r in c.execute("select id,label,pct,(select count(*) from parts p where p.choice=choices.id) from choices where bet=? order by id", (b["id"],))]
     mine = c.execute("select choice from parts where bet=? and uid=?", (b["id"], uid)).fetchone()
     return dict(id=b["id"], title=b["title"], stake=b["stake"], status=b["status"], closes_at=b["closes_at"], choices=ch,
                 n=c.execute("select count(*) from parts where bet=?", (b["id"],)).fetchone()[0], mine=mine[0] if mine else None,
@@ -101,7 +111,7 @@ class X:  # contexte de requête
     def __init__(s, **k): s.__dict__.update(k)
 
 def session_cookie(tok, age): return f"tb={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}" + ("; Secure" if SECURE else "")
-def me_json(u): return dict(id=u["id"], email=u["email"], name=u["name"], role=u["role"], bal=u["bal"], block_until=u["block_until"], csrf=u["csrf"])
+def me_json(u): return dict(id=u["id"], email=u["email"], name=u["name"], fullname=u["fullname"], role=u["role"], bal=u["bal"], block_until=u["block_until"], csrf=u["csrf"])
 
 @route("POST", "/api/register")
 def register(x):
@@ -132,8 +142,28 @@ def logout(x):
 @route("GET", "/api/me", "u")
 def me(x): return 200, me_json(x.u)
 @route("PATCH", "/api/me", "u")
-def patch_me(x):  # liste blanche : seul le nom est modifiable (pas de rôle, solde, statut)
-    x.c.execute("update users set name=? where id=?", (S(x.b.get("name"), 2, 30), x.u["id"])); return 200, {"ok": True}
+def patch_me(x):  # liste blanche : pseudo et nom uniquement (jamais rôle, solde, statut, e-mail)
+    n = S(x.b["name"], 2, 30) if "name" in x.b else x.u["name"]
+    f = str(x.b["fullname"]).strip()[:60] if "fullname" in x.b else x.u["fullname"]
+    x.c.execute("update users set name=?, fullname=? where id=?", (n, f, x.u["id"])); log(x.c, x.u["id"], "profile_update", x.u["id"]); return 200, {"ok": True}
+@route("POST", "/api/me/email", "u")
+def set_email(x):  # action sensible : mot de passe actuel exigé
+    if hit(f"em:{x.u['id']}", 5, 3600): raise Err(429, "Trop de tentatives, réessayez plus tard")
+    e = S(x.b.get("email"), 5, 120).lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e): raise Err(400, "E-mail invalide")
+    if not vp(str(x.b.get("password", ""))[:100], x.u["ph"]): raise Err(403, "Mot de passe actuel incorrect")
+    try: x.c.execute("update users set email=? where id=?", (e, x.u["id"]))
+    except sqlite3.IntegrityError: raise Err(409, "Cette adresse n'est pas disponible")
+    log(x.c, x.u["id"], "email_change", x.u["id"]); return 200, {"ok": True}
+@route("POST", "/api/me/password", "u")
+def set_password(x):
+    if hit(f"pw:{x.u['id']}", 5, 900): raise Err(429, "Trop de tentatives, réessayez plus tard")
+    new = x.b.get("new")
+    if not vp(str(x.b.get("current", ""))[:100], x.u["ph"]): raise Err(403, "Mot de passe actuel incorrect")
+    if not isinstance(new, str) or not 10 <= len(new) <= 100: raise Err(400, "Nouveau mot de passe : 10 caractères minimum")
+    x.c.execute("update users set ph=? where id=?", (hp(new), x.u["id"]))
+    x.c.execute("delete from sess where uid=? and th!=?", (x.u["id"], x.u["th"]))  # déconnecte les autres appareils
+    log(x.c, x.u["id"], "password_change", x.u["id"]); return 200, {"ok": True}
 @route("POST", "/api/me/block", "u")
 def block(x):
     d = x.b.get("days")
@@ -333,16 +363,44 @@ class H(BaseHTTPRequestHandler):
 def serve(port=8000):
     init(); return ThreadingHTTPServer(("127.0.0.1", port), H)
 
+DEMO = [("Qui gagne le match de samedi ?", 500, 5, [("Équipe A", 55), ("Équipe B", 45)]),
+        ("Quel temps dimanche ?", 200, 3, [("Soleil", 40), ("Nuages", 35), ("Pluie", 25)]),
+        ("Vainqueur du quiz du vendredi", 300, 7, [("Camille", 30), ("Yanis", 30), ("Léa", 25), ("Hugo", 15)]),
+        ("Le colis arrive avant mardi ?", 100, 2, [("Oui", 65), ("Non", 35)])]
+def seed_bets(c, bookie_id):
+    n = 0
+    for t, st, d, ch in DEMO:
+        if c.execute("select 1 from bets where title=? and bookie=? and status='open'", (t, bookie_id)).fetchone(): continue  # ne recrée que ce qui n'est plus ouvert
+        bid = c.execute("insert into bets(bookie,title,stake,closes_at,ts) values(?,?,?,?,?)", (bookie_id, t, st, now() + d * 86400, now())).lastrowid
+        for l, p in ch: c.execute("insert into choices(bet,label,pct) values(?,?,?)", (bid, l, p))
+        n += 1
+    return n
+def more_bets():
+    init(); c = db(); r = c.execute("select id from users where email='bookie@demo.test'").fetchone()
+    print(f"{seed_bets(c, r[0])} pari(s) de démonstration ajouté(s)." if r else "Compte bookie@demo.test introuvable : lancez d'abord --seed."); c.close()
+def ensure_demo():
+    """Démo uniquement (désactivable : TOUTBET_NO_DEMO=1) : garantit des comptes et des paris ouverts au démarrage."""
+    init(); c = db()
+    try:
+        if c.execute("select count(*) from users").fetchone()[0] == 0: c.close(); return seed()
+        if c.execute("select 1 from bets where status='open' and closes_at>?", (now(),)).fetchone(): return
+        r = c.execute("select id from users where email='bookie@demo.test'").fetchone()
+        if r: print(f"Aucun pari ouvert : {seed_bets(c, r[0])} pari(s) de démonstration recréé(s).")
+        else:
+            pw = secrets.token_urlsafe(9); uid = mk_user(c, "bookie@demo.test", "Bookie", pw, "bookie"); n = seed_bets(c, uid)
+            print(f"Aucun pari ouvert : compte Bookie de démo créé (affiché une seule fois)\n  bookie@demo.test  {pw}\n{n} paris de démonstration ajoutés.")
+    finally: c.close()
 def seed():
     init(); c = db(); pw = {}
     for e, n, r in [("admin@demo.test", "Admin", "admin"), ("bookie@demo.test", "Bookie", "bookie"), ("alice@demo.test", "Alice", "parieur"), ("bob@demo.test", "Bob", "parieur")]:
         pw[e] = secrets.token_urlsafe(9); mk_user(c, e, n, pw[e], r)  # mots de passe aléatoires, affichés une seule fois
-    c.execute("insert into bets(bookie,title,stake,closes_at,ts) values(2,'Qui gagne le match de samedi ?',500,?,?)", (now() + 5 * 86400, now()))
-    for l, p in (("Équipe A", 55), ("Équipe B", 45)): c.execute("insert into choices(bet,label,pct) values(1,?,?)", (l, p))
-    c.close(); print("Comptes de démonstration (affichés une seule fois) :")
+    seed_bets(c, 2)
+    c.close(); print(f"Base : {DB}\nComptes de démonstration (affichés une seule fois) :")
     for e, p in pw.items(): print(f"  {e}  {p}")
 
 if __name__ == "__main__":
     if "--seed" in sys.argv: seed()
+    elif "--more-bets" in sys.argv: more_bets()
     else:
+        if os.environ.get("TOUTBET_NO_DEMO") != "1": ensure_demo()
         port = int(os.environ.get("PORT", 8000)); print(f"ToutBet' DÉMO (fonds fictifs) sur http://127.0.0.1:{port}"); serve(port).serve_forever()
