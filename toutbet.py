@@ -1,5 +1,5 @@
 """ToutBet' - prototype DEMO (fonds fictifs). Python 3.9+, sans dépendance."""
-import os, re, sys, json, time, sqlite3, secrets, hashlib, hmac, threading
+import os, re, sys, json, time, sqlite3, secrets, hashlib, hmac, threading, logging
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -10,6 +10,9 @@ SECURE = os.environ.get("TOUTBET_SECURE_COOKIE") == "1"
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 OFFSET = [0]  # décalage d'horloge (tests uniquement)
 def now(): return int(time.time()) + OFFSET[0]
+PENTEST = os.environ.get("TOUTBET_PENTEST") == "1"  # tests offensifs en local uniquement : desactive les limites de debit
+IAST = os.environ.get("TOUTBET_IAST") == "1"  # instrumentation des tests dynamiques (atelier 2)
+if IAST: logging.basicConfig(filename=os.environ.get("TOUTBET_IAST_LOG", "iast.log"), level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 SCHEMA = """
 create table if not exists users(id integer primary key, email text unique not null, name text not null, fullname text not null default '', ph text not null, role text not null default 'parieur', status text not null default 'active', block_until integer not null default 0, bal integer not null default 0, ts integer);
@@ -46,6 +49,7 @@ DUMMY = hp("dummy-password")  # égalise le temps de réponse si l'e-mail est in
 HITS, LOCK = {}, threading.Lock()
 def hit(key, n, per, add=True):
     """True si la limite est atteinte (DoS / force brute). Sinon enregistre l'appel."""
+    if PENTEST: return False
     with LOCK:
         t = time.time(); q = [x for x in HITS.get(key, []) if x > t - per]
         if len(q) >= n: HITS[key] = q; return True
@@ -178,7 +182,7 @@ def bets(x):
     if st not in ("open", "closed", "proposed", "settled"): raise Err(400, "Statut invalide")
     rows = x.c.execute("select * from bets where status=? order by closes_at limit 20 offset ?", (st, page(x) * 20)).fetchall()
     return 200, [pub(x.c, b, x.u["id"]) for b in rows]
-@route("GET", r"/api/bets/(\d+)", "u")
+@route("GET", r"/api/bets/(\d{1,9})", "u")
 def bet(x): return 200, pub(x.c, get_bet(x.c, int(x.g[0])), x.u["id"])
 
 @route("POST", "/api/bets", "bookie")
@@ -193,7 +197,7 @@ def create_bet(x):
     for l, p in zip(labels, pcts): x.c.execute("insert into choices(bet,label,pct) values(?,?,?)", (bid, l, p))
     log(x.c, x.u["id"], "bet_create", bid, bid); return 201, {"id": bid}
 
-@route("POST", r"/api/bets/(\d+)/join", "u")
+@route("POST", r"/api/bets/(\d{1,9})/join", "u")
 def join(x):
     b, u = get_bet(x.c, int(x.g[0])), x.u
     if u["block_until"] > now(): raise Err(403, "Votre compte est en blocage volontaire")
@@ -205,7 +209,7 @@ def join(x):
     except sqlite3.IntegrityError: raise Err(409, "Vous participez déjà à ce pari")
     tx(x.c, u["id"], "mise", -b["stake"], b["id"]); notify(x.c, u["id"], "joined", b); log(x.c, u["id"], "join", u["id"], b["id"])
     return 200, {"ok": True}
-@route("POST", r"/api/bets/(\d+)/leave", "u")
+@route("POST", r"/api/bets/(\d{1,9})/leave", "u")
 def leave(x):
     b, u = get_bet(x.c, int(x.g[0])), x.u
     if b["status"] != "open": raise Err(409, "Impossible d'annuler : le pari est clôturé")
@@ -213,14 +217,14 @@ def leave(x):
     if not p: raise Err(404, "Aucune participation")
     x.c.execute("delete from parts where id=?", (p["id"],)); tx(x.c, u["id"], "remboursement", p["stake"], b["id"]); log(x.c, u["id"], "leave", u["id"], b["id"])
     return 200, {"ok": True}
-@route("POST", r"/api/bets/(\d+)/close", "bookie")
+@route("POST", r"/api/bets/(\d{1,9})/close", "bookie")
 def close(x):
     b = get_bet(x.c, int(x.g[0])); owner_or_admin(x.u, b)
     if b["status"] != "open": raise Err(409, "Déjà clôturé")
     x.c.execute("update bets set status='closed' where id=?", (b["id"],))
     for r in x.c.execute("select uid from parts where bet=?", (b["id"],)).fetchall(): notify(x.c, r[0], "closed", b)
     log(x.c, x.u["id"], "close", b["id"], b["id"]); return 200, {"ok": True}
-@route("POST", r"/api/bets/(\d+)/result", "bookie")
+@route("POST", r"/api/bets/(\d{1,9})/result", "bookie")
 def result(x):
     b = get_bet(x.c, int(x.g[0])); owner_or_admin(x.u, b)
     if b["status"] != "closed": raise Err(409, "Le pari doit être clôturé")
@@ -229,7 +233,7 @@ def result(x):
     x.c.execute("update bets set status='proposed', result=? where id=?", (cid, b["id"]))
     for r in x.c.execute("select uid from parts where bet=?", (b["id"],)).fetchall(): notify(x.c, r[0], "proposed", b)
     log(x.c, x.u["id"], "result_proposed", b["id"], b["id"], f"choice={cid}"); return 200, {"ok": True}
-@route("POST", r"/api/bets/(\d+)/vote", "u")
+@route("POST", r"/api/bets/(\d{1,9})/vote", "u")
 def vote(x):
     b, u = get_bet(x.c, int(x.g[0])), x.u
     k = x.b.get("kind")
@@ -237,7 +241,7 @@ def vote(x):
     if not x.c.execute("select 1 from parts where bet=? and uid=?", (b["id"], u["id"])).fetchone(): raise Err(403, "Réservé aux participants")
     x.c.execute("insert or replace into votes values(?,?,?,?,?)", (b["id"], u["id"], k, str(x.b.get("comment", ""))[:200], now()))
     log(x.c, u["id"], "vote_" + k, u["id"], b["id"]); return 200, {"ok": True}
-@route("POST", r"/api/bets/(\d+)/settle", "bookie")
+@route("POST", r"/api/bets/(\d{1,9})/settle", "bookie")
 def settle(x):
     b = get_bet(x.c, int(x.g[0])); owner_or_admin(x.u, b)
     if b["status"] != "proposed": raise Err(409, "Aucun résultat à valider")
@@ -286,13 +290,13 @@ def read(x): x.c.execute("update notif set seen=1 where uid=?", (x.u["id"],)); r
 def a_users(x):
     rows = x.c.execute("select id,email,name,role,status,block_until from users order by id limit 50 offset ?", (page(x) * 50,))
     return 200, [dict(r) for r in rows]
-@route("POST", r"/api/admin/users/(\d+)/role", "admin")
+@route("POST", r"/api/admin/users/(\d{1,9})/role", "admin")
 def a_role(x):
     uid, r = int(x.g[0]), x.b.get("role")
     if r not in ("parieur", "bookie", "admin") or uid == x.u["id"]: raise Err(400, "Changement refusé")
     if x.c.execute("update users set role=? where id=?", (r, uid)).rowcount != 1: raise Err(404, "Utilisateur introuvable")
     log(x.c, x.u["id"], "role_change", uid, detail=r); return 200, {"ok": True}
-@route("POST", r"/api/admin/users/(\d+)/status", "admin")
+@route("POST", r"/api/admin/users/(\d{1,9})/status", "admin")
 def a_status(x):
     uid, s = int(x.g[0]), x.b.get("suspended")
     if type(s) is not bool or uid == x.u["id"]: raise Err(400, "Changement refusé")
@@ -310,7 +314,9 @@ def load(name):
     with open(os.path.join(STATIC, name), "rb") as fh: return fh.read()
 PAGES = {k: (load(n), t) for k, (n, t) in FILES.items()}
 HDR = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
-       "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"}
+       "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+       "Cross-Origin-Resource-Policy": "same-origin", "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp",
+       "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()"}
 def auth(c, h):
     m = SimpleCookie(h.get("Cookie", "")).get("tb")
     if not m: return None
@@ -318,14 +324,24 @@ def auth(c, h):
     return dict(r) if r and r["status"] != "suspended" else None  # rôle relu en base à chaque requête
 
 class H(BaseHTTPRequestHandler):
+    timeout = 10
+    server_version, sys_version = "ToutBet", ""
+    error_message_format, error_content_type = '{"error": "Requete refusee (%(code)d)"}', "application/json"
     def log_message(self, *a): pass
+    def handle_one_request(self):
+        try: super().handle_one_request()
+        except Exception:
+            logging.exception("Exception non geree hors routeur")
+            raise
     def out(self, st, data, ctype="application/json", cookie=None):
+        if IAST: logging.info("%s %s -> %s %s", self.command, self.path, st, data.get("error", "") if isinstance(data, dict) else "")
         body = data if isinstance(data, bytes) else json.dumps(data).encode()
         self.send_response(st); self.send_header("Content-Type", ctype + "; charset=utf-8"); self.send_header("Content-Length", str(len(body)))
         for k, v in HDR.items(): self.send_header(k, v)
         if ctype == "application/json": self.send_header("Cache-Control", "no-store")
         if cookie: self.send_header("Set-Cookie", cookie)
-        self.end_headers(); self.wfile.write(body)
+        try: self.end_headers(); self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError): self.close_connection = True
     def handle_req(self):
         u = urlparse(self.path); ip = self.client_address[0]
         if not u.path.startswith("/api/"):
@@ -333,12 +349,16 @@ class H(BaseHTTPRequestHandler):
             if self.command != "GET" or not f: return self.out(404, {"error": "Introuvable"})
             return self.out(200, f[0], f[1])
         if hit(f"ip:{ip}", 300, 60): return self.out(429, {"error": "Trop de requêtes"})
-        n = int(self.headers.get("Content-Length") or 0)
+        try: n = int(self.headers.get("Content-Length") or 0)
+        except ValueError: return self.out(400, {"error": "Requête invalide"})
+        if n < 0: return self.out(400, {"error": "Requête invalide"})
         if n > 16384: return self.out(413, {"error": "Requête trop volumineuse"})
+        raw = self.rfile.read(n)
+        if len(raw) != n: return self.out(400, {"error": "Requête incomplète"})
         try:
-            body = json.loads(self.rfile.read(n) or b"{}")
+            body = json.loads(raw or b"{}")
             if not isinstance(body, dict): raise ValueError
-        except ValueError: return self.out(400, {"error": "JSON invalide"})
+        except (ValueError, RecursionError): return self.out(400, {"error": "JSON invalide"})
         c = db()
         try:
             c.execute("BEGIN IMMEDIATE"); sweep(c); usr = auth(c, self.headers)
@@ -358,13 +378,16 @@ class H(BaseHTTPRequestHandler):
             if c.in_transaction: c.execute("ROLLBACK")
             self.out(e.st, {"error": e.msg})
         except Exception:
+            logging.exception("Erreur 500 sur %s %s", self.command, u.path)
             if c.in_transaction: c.execute("ROLLBACK")
             self.out(500, {"error": "Erreur interne"})
         finally: c.close()
     do_GET = do_POST = do_PATCH = do_PUT = do_DELETE = handle_req
 
+class Srv(ThreadingHTTPServer):
+    request_queue_size, daemon_threads = 128, True
 def serve(port=8000):
-    init(); return ThreadingHTTPServer(("127.0.0.1", port), H)
+    init(); return Srv(("127.0.0.1", port), H)
 
 DEMO = [("Qui gagne le match de samedi ?", 500, 5, [("Équipe A", 55), ("Équipe B", 45)]),
         ("Quel temps dimanche ?", 200, 3, [("Soleil", 40), ("Nuages", 35), ("Pluie", 25)]),
