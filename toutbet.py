@@ -306,6 +306,9 @@ def a_audit(x):
 
 # ---------- Serveur HTTP ----------
 FILES = {"/": ("index.html", "text/html"), "/admin": ("admin.html", "text/html"), "/app.js": ("app.js", "text/javascript"), "/style.css": ("style.css", "text/css")}
+def load(name):
+    with open(os.path.join(STATIC, name), "rb") as fh: return fh.read()
+PAGES = {k: (load(n), t) for k, (n, t) in FILES.items()}
 HDR = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
        "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"}
 def auth(c, h):
@@ -326,9 +329,9 @@ class H(BaseHTTPRequestHandler):
     def handle_req(self):
         u = urlparse(self.path); ip = self.client_address[0]
         if not u.path.startswith("/api/"):
-            f = FILES.get(u.path)
+            f = PAGES.get(u.path)
             if self.command != "GET" or not f: return self.out(404, {"error": "Introuvable"})
-            return self.out(200, open(os.path.join(STATIC, f[0]), "rb").read(), f[1])
+            return self.out(200, f[0], f[1])
         if hit(f"ip:{ip}", 300, 60): return self.out(429, {"error": "Trop de requêtes"})
         n = int(self.headers.get("Content-Length") or 0)
         if n > 16384: return self.out(413, {"error": "Requête trop volumineuse"})
